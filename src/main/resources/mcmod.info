@@ -1,0 +1,10 @@
+[
+  {
+    "modid": "chachabridge",
+    "name": "ChaCha Bridge",
+    "description": "Auto-holds right click for cha cha bridging.",
+    "version": "1.0",
+    "mcversion": "1.8.9",
+    "authorList": []
+  }
+]
