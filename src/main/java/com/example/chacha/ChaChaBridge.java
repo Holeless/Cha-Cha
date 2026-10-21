@@ -26,8 +26,9 @@ import org.lwjgl.input.Keyboard;
  *
  * Session:
  *  - Starts when you jump while moving backwards (away from where you look) with |pitch| in 64..74.
- *  - Ends (right click released) when |pitch| leaves 64..74, you turn more than
- *    TURN_AROUND_DEGREES from the starting yaw, or you start moving forward.
+ *  - Ends (right click released) when |pitch| stays outside 64..74, you stay turned more than
+ *    TURN_AROUND_DEGREES from the starting yaw, or you keep moving forward (relative to the starting
+ *    direction). Short wobbles of a few ticks are ignored, so swinging your mouse to slow down is fine.
  *
  * Modes (during a session):
  *  - HOLD : once you're falling (past the jump apex) and your crosshair is on a block, right click
@@ -44,7 +45,9 @@ public class ChaChaBridge {
     // ---- tweakables ----
     static final float PITCH_MIN = 64f;
     static final float PITCH_MAX = 74f;
-    static final float TURN_AROUND_DEGREES = 90f;
+    static final float TURN_AROUND_DEGREES = 120f;    // yaw change from where the session began that counts as turned around
+    static final int PITCH_GRACE_TICKS = 3;           // ticks the pitch may sit outside the range before the session ends
+    static final int TURN_GRACE_TICKS = 4;            // ticks you must stay turned around / moving forward before it ends
     static final double MIN_SPEED = 0.05;             // blocks/tick to count as moving
     static final double PLACE_BELOW_MOTION_Y = 0.0;   // in the air, only place once motionY <= this
     static final boolean ONLY_BEHIND = false;         // SMART: only place blocks behind you (can be too strict)
@@ -63,6 +66,7 @@ public class ChaChaBridge {
     private boolean wasOnGround = true;
     private int bridgeY = 0;
     private float startYaw = 0f;
+    private int pitchBadTicks = 0, turnTicks = 0, fwdTicks = 0;
     private String lastDebug = "";
 
     @Mod.EventHandler
@@ -113,15 +117,27 @@ public class ChaChaBridge {
         double lookZ = Math.cos(yawRad);
         double dot = speed > 1.0E-4 ? (dx * lookX + dz * lookZ) / speed : 0;
         boolean movingBackwards = speed > MIN_SPEED && dot < -0.5;
-        boolean movingForwards = speed > MIN_SPEED && dot > 0.3;
 
         boolean justJumped = wasOnGround && !p.onGround && p.motionY > 0;
 
         if (session) {
             float yawDiff = Math.abs(wrap(p.rotationYaw - startYaw));
-            if (!pitchOk || yawDiff > TURN_AROUND_DEGREES || movingForwards) {
-                String why = !pitchOk ? "pitch " + (int) absPitch + " outside " + (int) PITCH_MIN + "-" + (int) PITCH_MAX
-                        : (movingForwards ? "moving forward" : "turned around");
+            // "forward" is judged against the direction you were facing when the session began,
+            // so swinging the mouse back and forth doesn't count as turning around.
+            double sYaw = Math.toRadians(startYaw);
+            double dotStart = speed > 1.0E-4 ? (dx * -Math.sin(sYaw) + dz * Math.cos(sYaw)) / speed : 0;
+            boolean fwdFromStart = speed > MIN_SPEED && dotStart > 0.3;
+
+            pitchBadTicks = pitchOk ? 0 : pitchBadTicks + 1;
+            turnTicks = yawDiff > TURN_AROUND_DEGREES ? turnTicks + 1 : 0;
+            fwdTicks = fwdFromStart ? fwdTicks + 1 : 0;
+
+            String why = null;
+            if (pitchBadTicks >= PITCH_GRACE_TICKS) why = "pitch " + (int) absPitch + " outside " + (int) PITCH_MIN + "-" + (int) PITCH_MAX;
+            else if (turnTicks >= TURN_GRACE_TICKS) why = "turned " + (int) yawDiff + " deg from where you started";
+            else if (fwdTicks >= TURN_GRACE_TICKS) why = "moving forward";
+
+            if (why != null) {
                 endSession();
                 dbg("session ended: " + why);
             } else if (p.onGround) {
@@ -132,6 +148,7 @@ public class ChaChaBridge {
                 session = true;
                 latched = false;
                 startYaw = p.rotationYaw;
+                pitchBadTicks = 0; turnTicks = 0; fwdTicks = 0;
                 bridgeY = floor(p.prevPosY + 0.01) - 1;
                 dbg("session started (bridge row y=" + bridgeY + ", mode " + (smart ? "SMART" : "HOLD") + ")");
             } else {
@@ -150,6 +167,8 @@ public class ChaChaBridge {
         String reason;   // null = OK to press
         if (!hasBlock) {
             reason = "no block in hand";
+        } else if (!pitchOk) {
+            reason = "pitch " + (int) absPitch + " out of range (waiting)";
         } else if (smart) {
             reason = !heightOk ? "still rising" : checkPlacement(p, lookX, lookZ);
         } else {
@@ -195,6 +214,7 @@ public class ChaChaBridge {
         if (holding) setUse(false);
         session = false;
         latched = false;
+        pitchBadTicks = 0; turnTicks = 0; fwdTicks = 0;
     }
 
     private void say(String s) {
