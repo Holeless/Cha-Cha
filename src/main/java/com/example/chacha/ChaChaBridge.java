@@ -5,9 +5,13 @@ import net.minecraft.client.entity.EntityPlayerSP;
 import net.minecraft.client.settings.KeyBinding;
 import net.minecraft.item.ItemBlock;
 import net.minecraft.item.ItemStack;
+import net.minecraft.util.AxisAlignedBB;
+import net.minecraft.util.BlockPos;
+import net.minecraft.util.ChatComponentText;
+import net.minecraft.util.EnumFacing;
 import net.minecraft.util.MovingObjectPosition;
-import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.fml.client.registry.ClientRegistry;
+import net.minecraftforge.fml.common.FMLCommonHandler;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.common.event.FMLInitializationEvent;
 import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
@@ -18,41 +22,46 @@ import org.lwjgl.input.Keyboard;
 /**
  * Cha cha bridging helper for Forge 1.8.9 (client side only).
  *
- * Flow:
- *  1. You jump while moving backwards (away from where you look) with |pitch| in 64..74.
- *     -> a bridging "session" starts.
- *  2. Once you're past the apex of that jump (falling), the mod starts holding right click
- *     and KEEPS holding it (it never releases between jumps).
- *  3. The session ends, and right click is released, when |pitch| leaves 64..74, you turn
- *     around (yaw changes by more than TURN_AROUND_DEGREES from where the session began),
- *     or you start moving forward.
+ * Session:
+ *  - Starts when you jump while moving backwards (away from where you look) with |pitch| in 64..74.
+ *  - Ends (and right click is released) when |pitch| leaves 64..74, you turn more than
+ *    TURN_AROUND_DEGREES away from the starting yaw, or you start moving forward.
+ *
+ * During a session right click is held ONLY on ticks where the click would be a good placement,
+ * which is worked out from where your crosshair ray actually lands:
+ *  - it hits the side face of a block (never a top/bottom face),
+ *  - the new block would sit exactly on the bridge row (one below your feet level),
+ *  - that spot is empty, is behind you, and doesn't overlap your hitbox,
+ *  - and you're either on the ground or already falling (not still rising).
+ * Because a failed click in 1.8.9 still burns the 4 tick right-click delay, skipping bad
+ * moments means every click that does fire is a real placement.
  */
-@Mod(modid = "chachabridge", name = "ChaCha Bridge", version = "1.0",
+@Mod(modid = "chachabridge", name = "ChaCha Bridge", version = "1.1",
         clientSideOnly = true, acceptedMinecraftVersions = "[1.8.9]")
 public class ChaChaBridge {
 
     // ---- tweakables ----
     static final float PITCH_MIN = 64f;
     static final float PITCH_MAX = 74f;
-    static final double PLACE_BELOW_MOTION_Y = 0.0;   // start holding once motionY <= this (past apex). Raise (e.g. 0.1) to place earlier.
     static final float TURN_AROUND_DEGREES = 90f;
-    static final double MIN_SPEED = 0.05;             // blocks/tick needed to count as "moving"
+    static final double MIN_SPEED = 0.05;             // blocks/tick to count as moving
+    static final double PLACE_BELOW_MOTION_Y = 0.0;   // in the air, only place once motionY <= this. Use 10 to allow rising placements.
+    static final boolean ONLY_BEHIND = true;          // only place blocks behind you (not to the sides)
 
     private final Minecraft mc = Minecraft.getMinecraft();
     private final KeyBinding toggleKey = new KeyBinding("Toggle ChaCha Bridge", Keyboard.KEY_V, "ChaCha Bridge");
 
     private boolean enabled = true;
     private boolean session = false;
-    private boolean latched = false;     // first drop has happened; hold until session ends
-    private boolean holding = false;     // we are currently forcing right click
+    private boolean holding = false;
     private boolean wasOnGround = true;
+    private int bridgeY = 0;
     private float startYaw = 0f;
 
     @Mod.EventHandler
     public void init(FMLInitializationEvent e) {
         ClientRegistry.registerKeyBinding(toggleKey);
-        MinecraftForge.EVENT_BUS.register(this);
-        net.minecraftforge.fml.common.FMLCommonHandler.instance().bus().register(this);
+        FMLCommonHandler.instance().bus().register(this);
     }
 
     @SubscribeEvent
@@ -61,7 +70,7 @@ public class ChaChaBridge {
             enabled = !enabled;
             if (!enabled) endSession();
             if (mc.thePlayer != null) {
-                mc.thePlayer.addChatMessage(new net.minecraft.util.ChatComponentText(
+                mc.thePlayer.addChatMessage(new ChatComponentText(
                         "\u00a7bChaCha Bridge: " + (enabled ? "\u00a7aON" : "\u00a7cOFF")));
             }
         }
@@ -80,7 +89,6 @@ public class ChaChaBridge {
         float absPitch = Math.abs(p.rotationPitch);
         boolean pitchOk = absPitch >= PITCH_MIN && absPitch <= PITCH_MAX;
 
-        // horizontal movement relative to where we're looking
         double dx = p.posX - p.prevPosX;
         double dz = p.posZ - p.prevPosZ;
         double speed = Math.sqrt(dx * dx + dz * dz);
@@ -97,11 +105,13 @@ public class ChaChaBridge {
             float yawDiff = Math.abs(wrap(p.rotationYaw - startYaw));
             if (!pitchOk || yawDiff > TURN_AROUND_DEGREES || movingForwards) {
                 endSession();
+            } else if (p.onGround) {
+                bridgeY = MathHelperFloor(p.posY + 0.01) - 1;
             }
         } else if (justJumped && pitchOk && movingBackwards) {
             session = true;
-            latched = false;
             startYaw = p.rotationYaw;
+            bridgeY = MathHelperFloor(p.prevPosY + 0.01) - 1;
         }
 
         wasOnGround = p.onGround;
@@ -109,18 +119,33 @@ public class ChaChaBridge {
 
         ItemStack held = p.getHeldItem();
         boolean hasBlock = held != null && held.getItem() instanceof ItemBlock;
+        boolean heightOk = p.onGround || p.motionY <= PLACE_BELOW_MOTION_Y;
 
-        // first trigger: past the apex of the jump and aimed at a block
-        if (!latched) {
-            boolean lookingAtBlock = mc.objectMouseOver != null
-                    && mc.objectMouseOver.typeOfHit == MovingObjectPosition.MovingObjectType.BLOCK;
-            if (hasBlock && !p.onGround && p.motionY <= PLACE_BELOW_MOTION_Y && lookingAtBlock) {
-                latched = true;
-            }
+        setUse(hasBlock && heightOk && validPlacement(p, lookX, lookZ));
+    }
+
+    /** True if a right click right now would put a block on the bridge row. */
+    private boolean validPlacement(EntityPlayerSP p, double lookX, double lookZ) {
+        // Own ray trace from the current eye position/rotation (mc.objectMouseOver is a tick stale).
+        MovingObjectPosition hit = p.rayTrace(mc.playerController.getBlockReachDistance(), 1.0f);
+        if (hit == null || hit.typeOfHit != MovingObjectPosition.MovingObjectType.BLOCK) return false;
+
+        EnumFacing side = hit.sideHit;
+        if (side.getAxis() == EnumFacing.Axis.Y) return false;           // top/bottom face = wrong spot
+
+        BlockPos target = hit.getBlockPos().offset(side);
+        if (target.getY() != bridgeY) return false;                       // must be the bridge row
+        if (!mc.theWorld.isAirBlock(target)) return false;                // already filled
+
+        AxisAlignedBB box = new AxisAlignedBB(target, target.add(1, 1, 1));
+        if (box.intersectsWith(p.getEntityBoundingBox())) return false;   // would be blocked by you
+
+        if (ONLY_BEHIND) {
+            double rx = target.getX() + 0.5 - p.posX;
+            double rz = target.getZ() + 0.5 - p.posZ;
+            if (rx * lookX + rz * lookZ > 0) return false;
         }
-
-        // once latched, keep holding right click for the rest of the session
-        setUse(latched && hasBlock);
+        return true;
     }
 
     private void setUse(boolean down) {
@@ -132,7 +157,11 @@ public class ChaChaBridge {
     private void endSession() {
         if (holding) setUse(false);
         session = false;
-        latched = false;
+    }
+
+    private static int MathHelperFloor(double v) {
+        int i = (int) v;
+        return v < i ? i - 1 : i;
     }
 
     private static float wrap(float deg) {
